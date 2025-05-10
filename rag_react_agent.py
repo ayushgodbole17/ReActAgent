@@ -1,97 +1,107 @@
-# rag_react_agent.py
-
 import os
 from dotenv import load_dotenv
-from langchain_chroma import Chroma
-from openai_utils import chat_completion
 
 # Load environment variables
 load_dotenv()
 
-# Initialize persistent Chroma vector store
-store = Chroma(persist_directory="vector_db", embedding_function=None)
+# Community packages (latest LangChain v0.2+)
+from langchain_community.chat_models import ChatOpenAI
+from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain.tools import Tool
+from langchain.prompts import PromptTemplate
+from langchain.agents import create_react_agent, AgentExecutor
+from langchain.callbacks.manager import CallbackManager
 
+# 1) Initialize embeddings and vector store
+embeddings = OpenAIEmbeddings()
+store = Chroma(
+    persist_directory="vector_db",
+    embedding_function=embeddings
+)
+
+# 2) Define RAG retrieval function and wrap as a Tool
 def rag_retrieve(query: str, k: int = 5) -> str:
-    """
-    Retrieve the top-k most relevant document chunks for the query.
-    """
     docs = store.similarity_search(query, k=k)
     return "\n\n".join(d.page_content for d in docs)
 
-def parse_react(output: str) -> tuple[str, str]:
-    """
-    Extract the latest Thought and Action lines from the LLM output.
-    Raises ValueError if parsing fails.
-    """
-    thought = None
-    action = None
-    for line in output.splitlines():
-        if line.startswith("Thought"):
-            thought = line.split(":", 1)[1].strip()
-        if line.startswith("Action"):
-            action = line.split(":", 1)[1].strip()
-            break
-    if thought is None or action is None:
-        raise ValueError(f"Could not parse Thought/Action from output:\n{output}")
-    return thought, action
+rag_tool = Tool(
+    name="RAGRetrieve",
+    func=rag_retrieve,
+    description="Retrieve relevant document chunks for a given query"
+)
 
-# … keep your imports, load_dotenv(), and rag_retrieve/parse_react definitions …
+# 3) Prompt template for the ReAct agent
+template = """
+Answer the following question as best you can. You have access to the following tool:
 
-def react_agent(question: str, max_steps: int = 5) -> str:
+{tools}
+
+Follow this exact format (no extra text):
+
+Question: the input question
+Thought: think about what to do next
+Action: one of [{tool_names}]
+Action Input: the input to the action
+Observation: the result of the action
+... (repeat Thought/Action/Action Input/Observation as needed) ...
+Thought: I now know the final answer
+Final Answer: the final answer
+
+Begin!
+Question: {input}
+{agent_scratchpad}
+"""
+prompt = PromptTemplate(
+    input_variables=["input", "agent_scratchpad", "tools", "tool_names"],
+    template=template
+)
+
+# 4) Agent execution function
+def run_agent(
+    question: str,
+    max_steps: int = 5,
+    callbacks: list = None
+):
     """
-    Run the ReAct loop: use RAGRetrieve[...] for retrieval and Finish[...] for final answer.
-    If the model fails to follow ReAct format, return its raw output as the answer.
+    Runs the ReAct agent with RAG retrieval.
+    - If callbacks provided, stream intermediate steps via those handlers.
+    - Returns final answer (and trace when not streaming).
     """
-    # 1. Stronger system instruction to enforce ReAct formatting
-    system_msg = {
-        "role": "system",
-        "content": (
-            "You are a research assistant. "
-            "Answer every question using exactly the following ReAct format:\n"
-            "Thought 1: ...\n"
-            "Action 1: RAGRetrieve[<query>]\n"
-            "Observation 1: ...\n"
-            "... (repeat Thought/Action/Observation as needed) ...\n"
-            "Finish[<final answer>]\n"
-            "Do not output anything outside these labels."
+    # Setup LLM with or without streaming
+    if callbacks:
+        cb_manager = CallbackManager(callbacks)
+        llm = ChatOpenAI(
+            model="gpt-4",
+            temperature=0.2,
+            streaming=True,
+            callback_manager=cb_manager
         )
-    }
-    context = [f"Question: {question}"]
+        return_intermediate = False
+    else:
+        llm = ChatOpenAI(
+            model="gpt-4",
+            temperature=0.2
+        )
+        return_intermediate = True
 
-    for i in range(1, max_steps + 1):
-        # Build the chat prompt
-        user_content = "\n".join(context) + f"\nThought {i}:"
-        messages = [system_msg, {"role": "user", "content": user_content}]
+    # Create agent and executor
+    agent = create_react_agent(llm, [rag_tool], prompt=prompt)
+    executor = AgentExecutor(
+        agent=agent,
+        tools=[rag_tool],
+        verbose=True,
+        handle_parsing_errors=True,
+        return_intermediate_steps=return_intermediate,
+        max_iterations=max_steps
+    )
 
-        # Get model output
-        output = chat_completion(messages).strip()
+    # Always use invoke so streaming callbacks get fired, and output key exists
+    result = executor.invoke({"input": question})
 
-        # Try parsing Thought/Action
-        try:
-            thought, action = parse_react(output)
-        except ValueError:
-            # Model didn't follow ReAct format: treat raw output as the final answer
-            return output
-
-        # Handle retrieval vs. finish
-        if action.startswith("RAGRetrieve["):
-            query = action[len("RAGRetrieve["):-1]
-            observation = rag_retrieve(query)
-            context.extend([
-                f"Thought {i}: {thought}",
-                f"Action {i}: {action}",
-                f"Observation {i}: {observation}"
-            ])
-        elif action.startswith("Finish["):
-            return action[len("Finish["):-1]
-        else:
-            # Unexpected label—abort with raw output
-            return output
-
-    return "Unable to answer within step limit."
-
-
-if __name__ == "__main__":
-    question = "Explain the key innovation of the Transformer architecture."
-    answer = react_agent(question)
-    print("Answer:", answer)
+    # Return based on mode
+    if callbacks:
+        # Streaming: result['output'] has the final answer
+        return result.get("output")
+    # Non-streaming: also return trace
+    return result.get("output"), result.get("intermediate_steps", [])
